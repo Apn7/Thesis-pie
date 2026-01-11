@@ -22,8 +22,8 @@ import os
 # Import modules
 from config import (
     LAPTOP_IP, LAPTOP_PORT, VIDEO_PATH, ALERT_COOLDOWN,
-    ALERT_MESSAGE, WINDOW_TITLE, ALERT_DISPLAY_DURATION,
-    CONFIDENCE_THRESHOLD
+    WINDOW_TITLE, ALERT_DISPLAY_DURATION,
+    CONFIDENCE_THRESHOLD, ALL_OBSTACLES
 )
 from detector import ObstacleDetector, FrameAnnotator
 from tcp_client import TCPClient
@@ -41,6 +41,7 @@ def print_banner():
     print(f"  Target App:  {LAPTOP_IP}:{LAPTOP_PORT}")
     print(f"  Cooldown:    {ALERT_COOLDOWN}s")
     print(f"  Threshold:   {CONFIDENCE_THRESHOLD}")
+    print(f"  Detectable:  {len(ALL_OBSTACLES)} obstacle types")
     print("-" * 65)
 
 
@@ -132,23 +133,37 @@ def main():
             results = detector.detect(frame)
             annotated_frame = detector.get_annotated_frame(results)
             
-            # Check for person/obstacle
-            obstacle_detected, confidence, bbox = detector.check_for_obstacle(results)
+            # Check for ALL obstacles (multi-object detection)
+            obstacles = detector.check_for_obstacles(results)
+            primary_obstacle = detector.get_most_critical_obstacle(results)
             
             # -----------------------------------------------------------------
             # IoT TRANSMISSION - Send Alert (with cooldown)
             # -----------------------------------------------------------------
             current_time = time.time()
             show_alert_banner = False
+            alert_level = "CRITICAL"
+            alert_message = ""
             
-            if obstacle_detected:
+            if primary_obstacle:
                 time_since_last = current_time - last_alert_time
                 
                 if time_since_last >= ALERT_COOLDOWN:
-                    print(f"\n[ALERT] Obstacle detected! Confidence: {confidence:.0%}")
+                    obstacle_name = primary_obstacle['name']
+                    obstacle_level = primary_obstacle['level']
+                    confidence = primary_obstacle['confidence']
+                    alert_message = primary_obstacle['message']
                     
-                    # Send TCP alert
-                    success = tcp_client.send_alert(ALERT_MESSAGE)
+                    print(f"\n[ALERT] {obstacle_level}: {obstacle_name} detected! ({confidence:.0%})")
+                    
+                    # Send TCP alert with specific message
+                    success = tcp_client.send_alert(alert_message)
+                    
+                    if success:
+                        last_alert_time = current_time
+                        alert_display_timer = current_time
+                        total_alerts_sent += 1
+                        alert_level = obstacle_level
                     
                     if success:
                         last_alert_time = current_time
@@ -161,11 +176,13 @@ def main():
             # -----------------------------------------------------------------
             # VISUAL FEEDBACK
             # -----------------------------------------------------------------
-            if obstacle_detected:
-                annotator.draw_obstacle_warning(annotated_frame, bbox, confidence)
+            # Draw ALL detected obstacles with their respective colors
+            if obstacles:
+                annotator.draw_all_obstacles(annotated_frame, obstacles)
             
-            if show_alert_banner:
-                annotator.draw_alert_banner(annotated_frame)
+            if show_alert_banner and primary_obstacle:
+                alert_msg = f">>> ALERT: {primary_obstacle['name'].upper()} <<<" 
+                annotator.draw_alert_banner(annotated_frame, alert_msg, alert_level)
             
             # Calculate FPS
             inference_time = time.time() - loop_start
@@ -176,10 +193,11 @@ def main():
             if last_alert_time == 0:
                 cooldown_remaining = 0
             
-            # Draw status bar
+            # Draw status bar with obstacle info
+            obstacle_name = primary_obstacle['name'] if primary_obstacle else None
             annotator.draw_status_bar(
                 annotated_frame, fps, frame_count,
-                obstacle_detected, cooldown_remaining
+                len(obstacles), cooldown_remaining, obstacle_name
             )
             
             # Alert counter (top-right)

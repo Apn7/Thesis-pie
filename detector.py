@@ -7,13 +7,16 @@
 
 import cv2
 from ultralytics import YOLO
-from config import MODEL_NAME, PERSON_CLASS_ID, CONFIDENCE_THRESHOLD
+from config import (
+    MODEL_NAME, CONFIDENCE_THRESHOLD, ALL_OBSTACLES,
+    get_obstacle_info, generate_alert_message
+)
 
 
 class ObstacleDetector:
     """
     YOLO-based obstacle detector optimized for Raspberry Pi 5.
-    Focuses on detecting persons as primary obstacles.
+    Detects multiple obstacle types for blind navigation assistance.
     """
     
     def __init__(self, model_path: str = MODEL_NAME):
@@ -26,7 +29,6 @@ class ObstacleDetector:
         self.model_path = model_path
         self.model = None
         self.confidence_threshold = CONFIDENCE_THRESHOLD
-        self.person_class_id = PERSON_CLASS_ID
     
     def load_model(self) -> bool:
         """
@@ -39,6 +41,7 @@ class ObstacleDetector:
             print(f"[DETECTOR] Loading {self.model_path}...")
             self.model = YOLO(self.model_path)
             print("[DETECTOR] ✓ Model loaded successfully")
+            print(f"[DETECTOR] ✓ Monitoring {len(ALL_OBSTACLES)} obstacle types")
             return True
         except Exception as e:
             print(f"[DETECTOR] ✗ Failed to load model: {e}")
@@ -59,19 +62,19 @@ class ObstacleDetector:
         
         return self.model(frame, verbose=False)
     
-    def check_for_obstacle(self, results) -> tuple:
+    def check_for_obstacles(self, results) -> list:
         """
-        Analyze detection results for person obstacles.
+        Analyze detection results for ALL obstacle types.
         
         Args:
             results: YOLO prediction results
         
         Returns:
-            Tuple of (detected: bool, confidence: float, bbox: tuple or None)
+            List of detected obstacles, each as dict with:
+            {class_id, name, level, confidence, bbox, color}
+            Sorted by danger level (CRITICAL first) then confidence
         """
-        detected = False
-        highest_confidence = 0.0
-        best_bbox = None
+        obstacles = []
         
         for result in results:
             boxes = result.boxes
@@ -80,16 +83,40 @@ class ObstacleDetector:
                 class_id = int(box.cls[0])
                 confidence = float(box.conf[0])
                 
-                # Check if detection is a Person with sufficient confidence
-                if class_id == self.person_class_id and confidence > self.confidence_threshold:
-                    detected = True
+                # Check if this class is one of our monitored obstacles
+                if class_id in ALL_OBSTACLES and confidence > self.confidence_threshold:
+                    name, level, color = get_obstacle_info(class_id)
                     
-                    if confidence > highest_confidence:
-                        highest_confidence = confidence
-                        # Extract bounding box coordinates (x1, y1, x2, y2)
-                        best_bbox = tuple(map(int, box.xyxy[0].tolist()))
+                    if name:  # Valid obstacle
+                        bbox = tuple(map(int, box.xyxy[0].tolist()))
+                        obstacles.append({
+                            'class_id': class_id,
+                            'name': name,
+                            'level': level,
+                            'confidence': confidence,
+                            'bbox': bbox,
+                            'color': color,
+                            'message': generate_alert_message(name, level)
+                        })
         
-        return detected, highest_confidence, best_bbox
+        # Sort by priority: CRITICAL > WARNING > CAUTION, then by confidence
+        level_priority = {'CRITICAL': 0, 'WARNING': 1, 'CAUTION': 2}
+        obstacles.sort(key=lambda x: (level_priority.get(x['level'], 3), -x['confidence']))
+        
+        return obstacles
+    
+    def get_most_critical_obstacle(self, results) -> dict:
+        """
+        Get the most critical/dangerous obstacle from results.
+        
+        Args:
+            results: YOLO prediction results
+        
+        Returns:
+            Dict with obstacle info or None if no obstacles
+        """
+        obstacles = self.check_for_obstacles(results)
+        return obstacles[0] if obstacles else None
     
     def get_annotated_frame(self, results) -> any:
         """
@@ -110,46 +137,77 @@ class FrameAnnotator:
     """
     
     @staticmethod
-    def draw_obstacle_warning(frame, bbox, confidence):
+    def draw_obstacle_warning(frame, obstacle: dict):
         """
-        Draw red warning box around detected obstacle.
+        Draw warning box around detected obstacle with appropriate color.
         
         Args:
             frame: OpenCV image frame
-            bbox: Bounding box (x1, y1, x2, y2)
-            confidence: Detection confidence
+            obstacle: Dict with obstacle info (bbox, name, level, confidence, color)
         """
-        if bbox is None:
+        if obstacle is None or 'bbox' not in obstacle:
             return
         
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = obstacle['bbox']
+        color = obstacle.get('color', (0, 0, 255))
+        name = obstacle.get('name', 'Unknown')
+        level = obstacle.get('level', 'WARNING')
+        confidence = obstacle.get('confidence', 0)
         
-        # Red warning box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        # Draw bounding box with level-appropriate color
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         
-        # Confidence label
-        label = f"OBSTACLE: {confidence:.0%}"
-        cv2.putText(frame, label, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # Label with name, level, and confidence
+        label = f"{level}: {name} ({confidence:.0%})"
+        
+        # Background for label
+        (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (x1, y1 - label_h - 10), (x1 + label_w + 5, y1), color, -1)
+        cv2.putText(frame, label, (x1 + 2, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
     @staticmethod
-    def draw_alert_banner(frame):
+    def draw_all_obstacles(frame, obstacles: list):
         """
-        Draw "SENDING ALERT" banner at top of frame.
+        Draw warnings for all detected obstacles.
         
         Args:
             frame: OpenCV image frame
+            obstacles: List of obstacle dicts
         """
+        for obstacle in obstacles:
+            FrameAnnotator.draw_obstacle_warning(frame, obstacle)
+    
+    @staticmethod
+    def draw_alert_banner(frame, message: str = ">>> SENDING ALERT TO APP <<<", 
+                          level: str = "CRITICAL"):
+        """
+        Draw alert banner at top of frame with level-appropriate color.
+        
+        Args:
+            frame: OpenCV image frame
+            message: Alert message to display
+            level: Danger level (CRITICAL/WARNING/CAUTION)
+        """
+        # Color based on level
+        colors = {
+            'CRITICAL': (0, 0, 200),    # Red
+            'WARNING': (0, 100, 200),   # Orange
+            'CAUTION': (0, 180, 200),   # Yellow
+        }
+        bg_color = colors.get(level, (0, 0, 200))
+        
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (frame.shape[1], 80), (0, 0, 200), -1)
+        cv2.rectangle(overlay, (0, 0), (frame.shape[1], 80), bg_color, -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
-        cv2.putText(frame, ">>> SENDING ALERT TO APP <<<", (20, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+        cv2.putText(frame, message, (20, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
     
     @staticmethod
     def draw_status_bar(frame, fps: float, frame_count: int, 
-                        obstacle_detected: bool, cooldown_remaining: float = 0):
+                        obstacle_count: int = 0, cooldown_remaining: float = 0,
+                        obstacle_name: str = None):
         """
         Draw status bar at bottom of frame.
         
@@ -157,8 +215,9 @@ class FrameAnnotator:
             frame: OpenCV image frame
             fps: Current frames per second
             frame_count: Current frame number
-            obstacle_detected: Whether obstacle is currently detected
+            obstacle_count: Number of obstacles detected
             cooldown_remaining: Seconds until next alert can be sent
+            obstacle_name: Name of primary detected obstacle
         """
         height, width = frame.shape[:2]
         
@@ -166,9 +225,12 @@ class FrameAnnotator:
         cv2.rectangle(frame, (0, height - 40), (width, height), (40, 40, 40), -1)
         
         # Status text
-        status_color = (0, 165, 255) if obstacle_detected else (0, 255, 0)
-        status_text = f"FPS: {fps:.1f} | Frame: {frame_count} | "
-        status_text += "OBSTACLE DETECTED" if obstacle_detected else "Clear Path"
+        if obstacle_count > 0:
+            status_color = (0, 165, 255)  # Orange
+            status_text = f"FPS: {fps:.1f} | {obstacle_count} obstacle(s): {obstacle_name or 'detected'}"
+        else:
+            status_color = (0, 255, 0)    # Green
+            status_text = f"FPS: {fps:.1f} | Frame: {frame_count} | Clear Path"
         
         cv2.putText(frame, status_text, (10, height - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
@@ -183,11 +245,13 @@ class FrameAnnotator:
 # Standalone test
 if __name__ == "__main__":
     import os
-    from config import VIDEO_PATH
+    from config import VIDEO_PATH, ALL_OBSTACLES
     
-    print("=" * 50)
-    print("  DETECTOR MODULE TEST")
-    print("=" * 50)
+    print("=" * 60)
+    print("  MULTI-OBSTACLE DETECTOR MODULE TEST")
+    print("=" * 60)
+    print(f"  Tracking {len(ALL_OBSTACLES)} obstacle types")
+    print("-" * 60)
     
     # Initialize detector
     detector = ObstacleDetector()
@@ -202,28 +266,41 @@ if __name__ == "__main__":
     cap = cv2.VideoCapture(VIDEO_PATH)
     annotator = FrameAnnotator()
     
-    print("\n[TEST] Running detection on first 30 frames...")
-    print("Press 'q' to quit early.\n")
+    print("\n[TEST] Running multi-obstacle detection...")
+    print("Press 'q' to quit.\n")
     
-    for i in range(30):
+    frame_count = 0
+    while True:
         ret, frame = cap.read()
         if not ret:
-            break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
         
+        frame_count += 1
         results = detector.detect(frame)
-        detected, conf, bbox = detector.check_for_obstacle(results)
         
-        if detected:
-            print(f"  Frame {i+1}: Person detected (confidence: {conf:.0%})")
+        # Get ALL obstacles
+        obstacles = detector.check_for_obstacles(results)
+        primary = detector.get_most_critical_obstacle(results)
         
         annotated = detector.get_annotated_frame(results)
-        if detected:
-            annotator.draw_obstacle_warning(annotated, bbox, conf)
         
-        cv2.imshow('Detector Test', annotated)
-        if cv2.waitKey(100) & 0xFF == ord('q'):
+        # Draw all obstacles
+        annotator.draw_all_obstacles(annotated, obstacles)
+        
+        # Draw status
+        primary_name = primary['name'] if primary else None
+        annotator.draw_status_bar(annotated, 30, frame_count, len(obstacles), 0, primary_name)
+        
+        # Log detections
+        if obstacles:
+            names = [f"{o['name']}({o['level'][0]})" for o in obstacles]
+            print(f"  Frame {frame_count}: {len(obstacles)} obstacle(s) - {', '.join(names)}")
+        
+        cv2.imshow('Multi-Obstacle Detector Test', annotated)
+        if cv2.waitKey(50) & 0xFF == ord('q'):
             break
     
     cap.release()
     cv2.destroyAllWindows()
-    print("\n✓ Detector test complete!")
+    print("\n✓ Multi-obstacle detector test complete!")
