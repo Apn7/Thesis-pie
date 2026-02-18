@@ -21,11 +21,11 @@ from ultralytics import YOLO
 # =============================================================================
 
 # Network Configuration (Flutter App Receiver)
-LAPTOP_IP = "192.168.1.100"  # <-- CHANGE THIS to your laptop's IP address
-LAPTOP_PORT = 4444           # Port the Flutter app is listening on
+LAPTOP_IP = "192.168.31.222"  # Phone's IP from Flutter app
+LAPTOP_PORT = 4444            # Port the Flutter app is listening on
 
 # Video Source (Simulated camera feed)
-VIDEO_PATH = '/home/pi/Downloads/test_walk.mp4'
+VIDEO_PATH = '/home/pi/Downloads/test_walk2.mp4'
 
 # AI Model Configuration
 MODEL_NAME = 'yolov8n.pt'    # YOLOv8 Nano - optimized for Raspberry Pi

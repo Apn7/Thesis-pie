@@ -164,11 +164,6 @@ def main():
                         alert_display_timer = current_time
                         total_alerts_sent += 1
                         alert_level = obstacle_level
-                    
-                    if success:
-                        last_alert_time = current_time
-                        alert_display_timer = current_time
-                        total_alerts_sent += 1
             
             # Show banner for ALERT_DISPLAY_DURATION seconds after send
             show_alert_banner = (current_time - alert_display_timer) < ALERT_DISPLAY_DURATION

@@ -8,7 +8,7 @@
 # =============================================================================
 # NETWORK CONFIGURATION
 # =============================================================================
-LAPTOP_IP = "192.168.31.140"    # Flutter App IP address
+LAPTOP_IP = "192.168.31.222"    # Flutter App IP address (from phone)
 LAPTOP_PORT = 4444              # TCP port the Flutter app listens on
 CONNECTION_TIMEOUT = 2.0        # Seconds to wait for connection
 
