@@ -1,262 +1,513 @@
 #!/usr/bin/env python3
 """
-=============================================================================
-  AUTONOMOUS SMART CANE - MAIN APPLICATION
-  
-  Thesis: "Autonomous Smart Cane: An IoT-Enabled, Vision and Voice-Assisted
-           Navigation Aid"
-  
-  This is the main entry point that orchestrates:
-  - Computer Vision (YOLOv8 obstacle detection)
-  - IoT Communication (TCP alerts to Flutter app)
-  
-  Author: [Your Name]
-  Platform: Raspberry Pi 5
-=============================================================================
+Smart Cane Vision System with BLE GATT Server
+Using multiprocessing to isolate BLE (GLib) from OpenCV (Qt)
 """
 
-import cv2
-import time
 import os
+import sys
+import time
+import signal
+import multiprocessing as mp
+from multiprocessing import Process, Queue, Event
+from typing import Optional
 
-# Import modules
+# Must set before importing cv2
+os.environ['QT_LOGGING_RULES'] = '*=false'
+os.environ['QT_DEBUG_PLUGINS'] = '0'
+
+import cv2
+
 from config import (
-    LAPTOP_IP, LAPTOP_PORT, VIDEO_PATH, ALERT_COOLDOWN,
-    WINDOW_TITLE, ALERT_DISPLAY_DURATION,
-    CONFIDENCE_THRESHOLD, ALL_OBSTACLES
+    MODEL_NAME, VIDEO_PATH, CONFIDENCE_THRESHOLD,
+    ALERT_COOLDOWN, WINDOW_TITLE
 )
 from detector import ObstacleDetector, FrameAnnotator
-from tcp_client import TCPClient
+
+# BLE UUIDs
+BLE_SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0'
+BLE_ALERT_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef1'
 
 
-def print_banner():
-    """Print startup banner with configuration info."""
-    print("=" * 65)
-    print("  ╔═══════════════════════════════════════════════════════════╗")
-    print("  ║     AUTONOMOUS SMART CANE - VISION & IoT MODULE          ║")
-    print("  ║     Thesis Demonstration System                          ║")
-    print("  ╚═══════════════════════════════════════════════════════════╝")
-    print("=" * 65)
-    print(f"\n  Platform:    Raspberry Pi 5")
-    print(f"  Target App:  {LAPTOP_IP}:{LAPTOP_PORT}")
-    print(f"  Cooldown:    {ALERT_COOLDOWN}s")
-    print(f"  Threshold:   {CONFIDENCE_THRESHOLD}")
-    print(f"  Detectable:  {len(ALL_OBSTACLES)} obstacle types")
-    print("-" * 65)
+# ============================================================================
+# BLE Server Process (completely isolated from OpenCV/Qt)
+# ============================================================================
 
-
-def main():
+def ble_server_process(alert_queue: Queue, connected_event: Event, shutdown_event: Event):
     """
-    Main application loop.
-    Combines vision detection with IoT transmission.
+    Run BLE GATT server in separate process.
+    Receives alerts via Queue and sends via BLE notifications.
     """
-    print_banner()
+    import dbus
+    import dbus.mainloop.glib
+    import dbus.service
+    from gi.repository import GLib
     
-    # =========================================================================
-    # INITIALIZATION
-    # =========================================================================
+    # BLE Constants
+    BLUEZ_SERVICE_NAME = 'org.bluez'
+    LE_ADVERTISING_MANAGER_IFACE = 'org.bluez.LEAdvertisingManager1'
+    DBUS_OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
+    DBUS_PROP_IFACE = 'org.freedesktop.DBus.Properties'
+    LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
+    GATT_MANAGER_IFACE = 'org.bluez.GattManager1'
+    GATT_SERVICE_IFACE = 'org.bluez.GattService1'
+    GATT_CHRC_IFACE = 'org.bluez.GattCharacteristic1'
     
-    # 1. Initialize Detector
-    print("\n[INIT] Initializing obstacle detector...")
-    detector = ObstacleDetector()
-    if not detector.load_model():
-        print("[FATAL] Cannot proceed without AI model.")
-        return
+    class Advertisement(dbus.service.Object):
+        PATH_BASE = '/org/bluez/example/advertisement'
+        
+        def __init__(self, bus, index, advertising_type):
+            self.path = self.PATH_BASE + str(index)
+            self.bus = bus
+            self.ad_type = advertising_type
+            self.service_uuids = None
+            self.local_name = None
+            self.include_tx_power = False
+            dbus.service.Object.__init__(self, bus, self.path)
+        
+        def get_properties(self):
+            properties = {'Type': self.ad_type}
+            if self.service_uuids:
+                properties['ServiceUUIDs'] = dbus.Array(self.service_uuids, signature='s')
+            if self.local_name:
+                properties['LocalName'] = dbus.String(self.local_name)
+            if self.include_tx_power:
+                properties['Includes'] = dbus.Array(["tx-power"], signature='s')
+            return {LE_ADVERTISEMENT_IFACE: properties}
+        
+        def get_path(self):
+            return dbus.ObjectPath(self.path)
+        
+        @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+        def GetAll(self, interface):
+            if interface != LE_ADVERTISEMENT_IFACE:
+                raise dbus.exceptions.DBusException('org.bluez.Error.InvalidArguments')
+            return self.get_properties()[LE_ADVERTISEMENT_IFACE]
+        
+        @dbus.service.method(LE_ADVERTISEMENT_IFACE)
+        def Release(self):
+            pass
     
-    # 2. Initialize TCP Client (Persistent Connection)
-    print(f"\n[INIT] Initializing TCP client -> {LAPTOP_IP}:{LAPTOP_PORT}")
-    tcp_client = TCPClient(LAPTOP_IP, LAPTOP_PORT)
+    class SmartCaneAdvertisement(Advertisement):
+        def __init__(self, bus, index):
+            Advertisement.__init__(self, bus, index, 'peripheral')
+            self.local_name = 'SmartCane'
+            self.service_uuids = [BLE_SERVICE_UUID]
+            self.include_tx_power = True
     
-    # Establish persistent connection
-    if tcp_client.connect():
-        print("[INIT] ✓ Persistent connection established!")
-    else:
-        print("[INIT] ⚠ Flutter app not reachable (will auto-reconnect)")
+    class Service(dbus.service.Object):
+        PATH_BASE = '/org/bluez/example/service'
+        
+        def __init__(self, bus, index, uuid, primary):
+            self.path = self.PATH_BASE + str(index)
+            self.bus = bus
+            self.uuid = uuid
+            self.primary = primary
+            self.characteristics = []
+            dbus.service.Object.__init__(self, bus, self.path)
+        
+        def get_properties(self):
+            return {
+                GATT_SERVICE_IFACE: {
+                    'UUID': self.uuid,
+                    'Primary': self.primary,
+                    'Characteristics': dbus.Array([c.get_path() for c in self.characteristics], signature='o')
+                }
+            }
+        
+        def get_path(self):
+            return dbus.ObjectPath(self.path)
+        
+        def add_characteristic(self, characteristic):
+            self.characteristics.append(characteristic)
+        
+        @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+        def GetAll(self, interface):
+            if interface != GATT_SERVICE_IFACE:
+                raise dbus.exceptions.DBusException('org.bluez.Error.InvalidArguments')
+            return self.get_properties()[GATT_SERVICE_IFACE]
     
-    # 3. Initialize Frame Annotator
-    annotator = FrameAnnotator()
+    class Characteristic(dbus.service.Object):
+        def __init__(self, bus, index, uuid, flags, service):
+            self.path = service.path + '/char' + str(index)
+            self.bus = bus
+            self.uuid = uuid
+            self.service = service
+            self.flags = flags
+            self.descriptors = []
+            dbus.service.Object.__init__(self, bus, self.path)
+        
+        def get_properties(self):
+            return {
+                GATT_CHRC_IFACE: {
+                    'Service': self.service.get_path(),
+                    'UUID': self.uuid,
+                    'Flags': self.flags,
+                    'Descriptors': dbus.Array([d.get_path() for d in self.descriptors], signature='o')
+                }
+            }
+        
+        def get_path(self):
+            return dbus.ObjectPath(self.path)
+        
+        @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+        def GetAll(self, interface):
+            if interface != GATT_CHRC_IFACE:
+                raise dbus.exceptions.DBusException('org.bluez.Error.InvalidArguments')
+            return self.get_properties()[GATT_CHRC_IFACE]
+        
+        @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
+        def ReadValue(self, options):
+            return []
+        
+        @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
+        def WriteValue(self, value, options):
+            pass
+        
+        @dbus.service.method(GATT_CHRC_IFACE)
+        def StartNotify(self):
+            pass
+        
+        @dbus.service.method(GATT_CHRC_IFACE)
+        def StopNotify(self):
+            pass
+        
+        @dbus.service.signal(DBUS_PROP_IFACE, signature='sa{sv}as')
+        def PropertiesChanged(self, interface, changed, invalidated):
+            pass
     
-    # 4. Open Video Source
-    print(f"\n[INIT] Opening video: {VIDEO_PATH}")
-    if not os.path.exists(VIDEO_PATH):
-        print(f"[FATAL] Video file not found: {VIDEO_PATH}")
-        print("[HINT] Download a walking video and save to that path.")
-        return
+    class AlertCharacteristic(Characteristic):
+        def __init__(self, bus, index, service, connected_event):
+            Characteristic.__init__(self, bus, index, BLE_ALERT_CHAR_UUID, ['notify', 'read'], service)
+            self.connected_event = connected_event
+            self.notifying = False
+            self.current_value = b'No obstacles'
+            print(f'[BLE] Alert Characteristic UUID: {BLE_ALERT_CHAR_UUID}')
+        
+        def ReadValue(self, options):
+            print(f'[BLE] ReadValue called - returning: {self.current_value}')
+            return dbus.Array(self.current_value, signature='y')
+        
+        def StartNotify(self):
+            print('[BLE] >>> StartNotify called!')
+            if self.notifying:
+                print('[BLE] Already notifying')
+                return
+            self.notifying = True
+            self.connected_event.set()
+            print('[BLE] ✓ Client connected and subscribed to notifications!')
+        
+        def StopNotify(self):
+            print('[BLE] >>> StopNotify called!')
+            if not self.notifying:
+                return
+            self.notifying = False
+            self.connected_event.clear()
+            print('[BLE] Client unsubscribed from notifications')
+        
+        def send_notification(self, message: str):
+            if not self.notifying:
+                return False
+            self.current_value = message.encode('utf-8')
+            print(f'[BLE] Sending notification: {message}')
+            self.PropertiesChanged(GATT_CHRC_IFACE, {'Value': dbus.Array(self.current_value, signature='y')}, [])
+            return True
     
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        print("[FATAL] Could not open video source.")
-        return
+    class SmartCaneService(Service):
+        def __init__(self, bus, index, connected_event):
+            Service.__init__(self, bus, index, BLE_SERVICE_UUID, True)
+            print(f'[BLE] Service UUID: {BLE_SERVICE_UUID}')
+            self.alert_char = AlertCharacteristic(bus, 0, self, connected_event)
+            self.add_characteristic(self.alert_char)
     
-    # Get video properties
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    class Application(dbus.service.Object):
+        def __init__(self, bus, connected_event):
+            self.path = '/'
+            self.services = []
+            dbus.service.Object.__init__(self, bus, self.path)
+            self.add_service(SmartCaneService(bus, 0, connected_event))
+        
+        def get_path(self):
+            return dbus.ObjectPath(self.path)
+        
+        def add_service(self, service):
+            self.services.append(service)
+        
+        @dbus.service.method(DBUS_OM_IFACE, out_signature='a{oa{sa{sv}}}')
+        def GetManagedObjects(self):
+            response = {}
+            for service in self.services:
+                response[service.get_path()] = service.get_properties()
+                for chrc in service.characteristics:
+                    response[chrc.get_path()] = chrc.get_properties()
+            return response
     
-    print(f"[INIT] ✓ Video: {frame_width}x{frame_height} @ {video_fps:.1f}fps")
-    print(f"[INIT] ✓ Frames: {total_frames}")
+    def find_adapter(bus):
+        remote_om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, '/'), DBUS_OM_IFACE)
+        objects = remote_om.GetManagedObjects()
+        for o, props in objects.items():
+            if GATT_MANAGER_IFACE in props.keys():
+                return o
+        return None
     
-    # =========================================================================
-    # MAIN LOOP
-    # =========================================================================
-    print("\n" + "=" * 65)
-    print("  STARTING SMART CANE VISION SYSTEM")
-    print("  Controls: [Q] Quit | [R] Restart Video | [T] Test Alert")
-    print("=" * 65 + "\n")
-    
-    # State variables
-    last_alert_time = 0.0
-    frame_count = 0
-    alert_display_timer = 0.0
-    total_alerts_sent = 0
-    
+    # Main BLE setup
     try:
-        while True:
-            loop_start = time.time()
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        bus = dbus.SystemBus()
+        
+        adapter_path = find_adapter(bus)
+        if not adapter_path:
+            print('[BLE] ERROR: No Bluetooth adapter found!')
+            return
+        
+        service_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), GATT_MANAGER_IFACE)
+        ad_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), LE_ADVERTISING_MANAGER_IFACE)
+        
+        # Power on adapter
+        adapter_props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), DBUS_PROP_IFACE)
+        adapter_props.Set('org.bluez.Adapter1', 'Powered', dbus.Boolean(1))
+        
+        # Create app and advertisement
+        app = Application(bus, connected_event)
+        adv = SmartCaneAdvertisement(bus, 0)
+        alert_char = app.services[0].alert_char
+        
+        # Unregister any previous application/advertisement first (cleanup from previous runs)
+        try:
+            service_manager.UnregisterApplication(app.get_path())
+            print('[BLE] Cleaned up previous GATT application')
+        except dbus.exceptions.DBusException:
+            pass  # No previous registration, that's fine
+        
+        try:
+            ad_manager.UnregisterAdvertisement(adv.get_path())
+            print('[BLE] Cleaned up previous advertisement')
+        except dbus.exceptions.DBusException:
+            pass  # No previous advertisement, that's fine
+        
+        # Register GATT application (only once!)
+        registration_complete = {'gatt': False, 'adv': False}
+        
+        def on_gatt_registered():
+            registration_complete['gatt'] = True
+            print('[BLE] ✓ GATT registered (single instance)')
+        
+        def on_gatt_error(error):
+            print(f'[BLE] GATT error: {error}')
+        
+        def on_adv_registered():
+            registration_complete['adv'] = True
+            print('[BLE] ✓ Advertising as "SmartCane"')
+        
+        def on_adv_error(error):
+            print(f'[BLE] Advertising error: {error}')
+        
+        service_manager.RegisterApplication(app.get_path(), {},
+            reply_handler=on_gatt_registered,
+            error_handler=on_gatt_error)
+        
+        ad_manager.RegisterAdvertisement(adv.get_path(), {},
+            reply_handler=on_adv_registered,
+            error_handler=on_adv_error)
+        
+        print('[BLE] ✓ Server started')
+        
+        # Create mainloop
+        mainloop = GLib.MainLoop()
+        
+        # Check for alerts from queue periodically
+        def check_queue():
+            if shutdown_event.is_set():
+                mainloop.quit()
+                return False
             
-            # -----------------------------------------------------------------
-            # READ FRAME
-            # -----------------------------------------------------------------
-            ret, frame = cap.read()
-            
-            if not ret:
-                print("\n[INFO] Video ended. Looping...")
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            
-            frame_count += 1
-            
-            # -----------------------------------------------------------------
-            # COMPUTER VISION - Obstacle Detection
-            # -----------------------------------------------------------------
-            results = detector.detect(frame)
-            annotated_frame = detector.get_annotated_frame(results)
-            
-            # Check for ALL obstacles (multi-object detection)
-            obstacles = detector.check_for_obstacles(results)
-            primary_obstacle = detector.get_most_critical_obstacle(results)
-            
-            # -----------------------------------------------------------------
-            # IoT TRANSMISSION - Send Alert (with cooldown)
-            # -----------------------------------------------------------------
-            current_time = time.time()
-            show_alert_banner = False
-            alert_level = "CRITICAL"
-            alert_message = ""
-            
-            if primary_obstacle:
-                time_since_last = current_time - last_alert_time
-                
-                if time_since_last >= ALERT_COOLDOWN:
-                    obstacle_name = primary_obstacle['name']
-                    obstacle_level = primary_obstacle['level']
-                    confidence = primary_obstacle['confidence']
-                    alert_message = primary_obstacle['message']
-                    
-                    print(f"\n[ALERT] {obstacle_level}: {obstacle_name} detected! ({confidence:.0%})")
-                    
-                    # Send TCP alert with specific message
-                    success = tcp_client.send_alert(alert_message)
-                    
-                    if success:
-                        last_alert_time = current_time
-                        alert_display_timer = current_time
-                        total_alerts_sent += 1
-                        alert_level = obstacle_level
-            
-            # Show banner for ALERT_DISPLAY_DURATION seconds after send
-            show_alert_banner = (current_time - alert_display_timer) < ALERT_DISPLAY_DURATION
-            
-            # -----------------------------------------------------------------
-            # VISUAL FEEDBACK
-            # -----------------------------------------------------------------
-            # Draw ALL detected obstacles with their respective colors
-            if obstacles:
-                annotator.draw_all_obstacles(annotated_frame, obstacles)
-            
-            if show_alert_banner and primary_obstacle:
-                alert_msg = f">>> ALERT: {primary_obstacle['name'].upper()} <<<" 
-                annotator.draw_alert_banner(annotated_frame, alert_msg, alert_level)
-            
-            # Calculate FPS
-            inference_time = time.time() - loop_start
-            fps = 1.0 / inference_time if inference_time > 0 else 0
-            
-            # Cooldown remaining
-            cooldown_remaining = max(0, ALERT_COOLDOWN - (current_time - last_alert_time))
-            if last_alert_time == 0:
-                cooldown_remaining = 0
-            
-            # Draw status bar with obstacle info
-            obstacle_name = primary_obstacle['name'] if primary_obstacle else None
-            annotator.draw_status_bar(
-                annotated_frame, fps, frame_count,
-                len(obstacles), cooldown_remaining, obstacle_name
-            )
-            
-            # Alert counter (top-right)
-            cv2.putText(annotated_frame, f"Alerts: {total_alerts_sent}",
-                        (frame_width - 130, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # Connection status indicator (top-left under FPS area)
-            conn_status = tcp_client.status
-            conn_color = (0, 255, 0) if tcp_client.is_connected else (0, 0, 255)
-            cv2.putText(annotated_frame, f"TCP: {conn_status}",
-                        (20, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_color, 2)
-            
-            # -----------------------------------------------------------------
-            # DISPLAY
-            # -----------------------------------------------------------------
-            cv2.imshow(WINDOW_TITLE, annotated_frame)
-            
-            # -----------------------------------------------------------------
-            # KEYBOARD CONTROLS
-            # -----------------------------------------------------------------
-            key = cv2.waitKey(1) & 0xFF
-            
-            if key == ord('q'):
-                print("\n[INFO] User requested exit.")
-                break
-            
-            elif key == ord('r'):
-                print("[INFO] Restarting video...")
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                frame_count = 0
-            
-            elif key == ord('t'):
-                # Manual test alert
-                print("\n[TEST] Sending manual test alert...")
-                tcp_client.send_alert("TEST: Manual alert from Smart Cane")
-                alert_display_timer = time.time()
+            try:
+                while not alert_queue.empty():
+                    msg = alert_queue.get_nowait()
+                    if alert_char.send_notification(msg):
+                        print(f'[BLE] Sent: {msg}')
+            except:
+                pass
+            return True  # Continue checking
+        
+        # Check queue every 100ms
+        GLib.timeout_add(100, check_queue)
+        
+        # Run mainloop
+        mainloop.run()
+        
+    except Exception as e:
+        print(f'[BLE] ERROR: {e}')
+
+
+# ============================================================================
+# Vision Process (runs OpenCV with Qt in isolation)
+# ============================================================================
+
+def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event):
+    """Main vision processing - runs in main process"""
     
-    except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by user (Ctrl+C)")
+    print('[DETECTOR] Loading YOLO model...')
+    detector = ObstacleDetector(MODEL_NAME)
+    detector.load_model()
     
-    # =========================================================================
-    # CLEANUP
-    # =========================================================================
-    print("\n" + "-" * 65)
-    print("[CLEANUP] Releasing resources...")
+    print(f'\n[INIT] Opening video: {VIDEO_PATH}')
+    cap = cv2.VideoCapture(VIDEO_PATH)
     
-    # Disconnect TCP client gracefully
-    tcp_client.disconnect()
+    if not cap.isOpened():
+        print(f'[ERROR] Cannot open video: {VIDEO_PATH}')
+        return
+    
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    print(f'[INIT] ✓ Video: {width}x{height} @ {fps:.1f}fps ({total_frames} frames)')
+    
+    # Create window
+    cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_TITLE, 960, 540)
+    
+    annotator = FrameAnnotator()
+    last_alert_time = 0
+    frame_delay = max(1, int(1000 / fps))
+    
+    print('\n' + '=' * 65)
+    print('  SMART CANE VISION SYSTEM - RUNNING')
+    print('  Controls: [Q] Quit | [R] Restart | [T] Test Alert')
+    print('=' * 65 + '\n')
+    
+    frame_count = 0
+    start_time = time.time()
+    
+    while not shutdown_event.is_set():
+        ret, frame = cap.read()
+        
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+        
+        frame_count += 1
+        current_time = time.time()
+        
+        # Detect obstacles - first detect, then check
+        results = detector.detect(frame)
+        obstacles = detector.check_for_obstacles(results)
+        critical = obstacles[0] if obstacles else None
+        
+        # Get annotated frame from YOLO
+        annotated = detector.get_annotated_frame(results)
+        
+        # Draw all obstacles with custom overlays
+        annotator.draw_all_obstacles(annotated, obstacles)
+        
+        # Calculate FPS
+        elapsed = current_time - start_time
+        current_fps = frame_count / elapsed if elapsed > 0 else 0
+        
+        # Draw status bar
+        cooldown_remaining = max(0, ALERT_COOLDOWN - (current_time - last_alert_time))
+        annotator.draw_status_bar(
+            annotated, 
+            current_fps, 
+            frame_count, 
+            len(obstacles),
+            cooldown_remaining,
+            critical['name'] if critical else None
+        )
+        
+        # BLE status overlay
+        is_connected = connected_event.is_set()
+        status_color = (0, 255, 0) if is_connected else (0, 165, 255)
+        status_text = "BLE: Connected" if is_connected else "BLE: Waiting..."
+        cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        
+        # Send alert if needed
+        if critical and (current_time - last_alert_time) >= ALERT_COOLDOWN:
+            # Calculate position (left/center/right)
+            x1, y1, x2, y2 = critical['bbox']
+            cx = (x1 + x2) // 2
+            frame_width = annotated.shape[1]
+            if cx < frame_width // 3:
+                position = "left"
+            elif cx > 2 * frame_width // 3:
+                position = "right"
+            else:
+                position = "center"
+            
+            msg = f"{critical['level']}:{critical['name']}:{critical['confidence']:.0%}:{position}"
+            alert_queue.put(msg)
+            
+            # Draw alert banner
+            annotator.draw_alert_banner(annotated, f"ALERT: {critical['name']} detected!", critical['level'])
+            
+            if is_connected:
+                print(f'[ALERT] {msg}')
+            else:
+                print(f'[ALERT] (queued) {msg}')
+            
+            last_alert_time = current_time
+        
+        # Show frame
+        cv2.imshow(WINDOW_TITLE, annotated)
+        
+        # Handle keys
+        key = cv2.waitKey(frame_delay) & 0xFF
+        if key == ord('q') or key == 27:
+            break
+        elif key == ord('r'):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            print('[INFO] Video restarted')
+        elif key == ord('t'):
+            test_msg = "TEST:manual:100%:center"
+            alert_queue.put(test_msg)
+            print(f'[TEST] Sent: {test_msg}')
     
     cap.release()
     cv2.destroyAllWindows()
+    shutdown_event.set()
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    # Use 'spawn' for clean process separation
+    mp.set_start_method('spawn', force=True)
     
-    print(f"\n  Session Summary:")
-    print(f"  - Frames processed: {frame_count}")
-    print(f"  - Alerts sent: {total_alerts_sent}")
-    print("\n[CLEANUP] ✓ Shutdown complete. Goodbye!")
-    print("=" * 65)
+    # Shared state
+    alert_queue = Queue()
+    connected_event = Event()
+    shutdown_event = Event()
+    
+    def signal_handler(sig, frame):
+        print('\n[INFO] Shutting down...')
+        shutdown_event.set()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start BLE server in separate process
+    print('[MAIN] Starting BLE server process...')
+    ble_proc = Process(target=ble_server_process, args=(alert_queue, connected_event, shutdown_event), daemon=True)
+    ble_proc.start()
+    
+    # Give BLE time to start
+    time.sleep(2.0)
+    
+    try:
+        # Run vision in main process
+        run_vision(alert_queue, connected_event, shutdown_event)
+    except Exception as e:
+        print(f'[ERROR] {e}')
+    finally:
+        shutdown_event.set()
+        ble_proc.terminate()
+        ble_proc.join(timeout=2.0)
+        print('[INFO] Goodbye!')
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
