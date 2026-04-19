@@ -60,7 +60,7 @@ class ObstacleDetector:
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
         
-        return self.model(frame, verbose=False)
+        return self.model(frame, verbose=False, imgsz=320)
     
     def check_for_obstacles(self, results) -> list:
         """

@@ -370,7 +370,7 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
     
     annotator = FrameAnnotator()
     last_alert_times = {}  # class_id -> last sent timestamp
-    frame_delay = max(1, int(1000 / fps))
+    frame_delay = 1  # process as fast as possible; inference is the real bottleneck
     
     print('\n' + '=' * 65)
     print('  SMART CANE VISION SYSTEM - RUNNING')
