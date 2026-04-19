@@ -1,0 +1,26 @@
+[Unit]
+Description=Smart Cane Vision System
+# Wait for Bluetooth and basic networking to be up before starting.
+After=bluetooth.target network.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Thesis
+ExecStart=/usr/bin/python3 /home/pi/Thesis/main.py
+Restart=on-failure
+RestartSec=5s
+
+# No display — headless mode is auto-detected by the absence of DISPLAY.
+Environment=DISPLAY=
+
+# Give the process time to clean up BLE on shutdown.
+TimeoutStopSec=10s
+
+# Write all stdout/stderr to the systemd journal (read with: journalctl -u smart-cane -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

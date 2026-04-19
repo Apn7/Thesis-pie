@@ -18,6 +18,9 @@ os.environ['QT_DEBUG_PLUGINS'] = '0'
 
 import cv2
 
+# True when running under systemd / SSH with no X display — skips all imshow calls.
+HEADLESS = not os.environ.get('DISPLAY')
+
 from config import (
     MODEL_NAME, VIDEO_PATH, CONFIDENCE_THRESHOLD,
     ALERT_COOLDOWN, WINDOW_TITLE
@@ -364,10 +367,10 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
     
     print(f'[INIT] ✓ Video: {width}x{height} @ {fps:.1f}fps ({total_frames} frames)')
     
-    # Create window
-    cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_TITLE, 960, 540)
-    
+    if not HEADLESS:
+        cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_TITLE, 960, 540)
+
     annotator = FrameAnnotator()
     last_alert_times = {}  # class_id -> last sent timestamp
     frame_delay = 1  # process as fast as possible; inference is the real bottleneck
@@ -451,20 +454,21 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
             else:
                 print(f'[ALERT] (queued) {msg}')
         
-        # Show frame
-        cv2.imshow(WINDOW_TITLE, annotated)
-        
-        # Handle keys
-        key = cv2.waitKey(frame_delay) & 0xFF
-        if key == ord('q') or key == 27:
-            break
-        elif key == ord('r'):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            print('[INFO] Video restarted')
-        elif key == ord('t'):
-            test_msg = "TEST:manual:100%:center"
-            alert_queue.put(test_msg)
-            print(f'[TEST] Sent: {test_msg}')
+        if HEADLESS:
+            # No display — yield CPU briefly so the process doesn't spin at 100%.
+            time.sleep(0.01)
+        else:
+            cv2.imshow(WINDOW_TITLE, annotated)
+            key = cv2.waitKey(frame_delay) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+            elif key == ord('r'):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                print('[INFO] Video restarted')
+            elif key == ord('t'):
+                test_msg = "TEST:manual:100%:center"
+                alert_queue.put(test_msg)
+                print(f'[TEST] Sent: {test_msg}')
     
     cap.release()
     cv2.destroyAllWindows()
