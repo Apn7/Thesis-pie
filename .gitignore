@@ -106,3 +106,5 @@ desktop.ini
 *.key
 secrets.py
 credentials.py
+
+CLAUDE.md

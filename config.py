@@ -15,7 +15,7 @@ CONNECTION_TIMEOUT = 2.0        # Seconds to wait for connection
 # =============================================================================
 # VIDEO SOURCE
 # =============================================================================
-VIDEO_PATH = '/home/pi/Downloads/test_walk2.mp4'
+VIDEO_PATH = '/home/pi/Downloads/person-bicycle-car-detection.mp4'
 
 # =============================================================================
 # AI MODEL CONFIGURATION

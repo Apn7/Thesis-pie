@@ -320,9 +320,8 @@ def ble_server_process(alert_queue: Queue, connected_event: Event, shutdown_even
             if shutdown_event.is_set():
                 mainloop.quit()
                 return False
-            
             try:
-                while not alert_queue.empty():
+                if not alert_queue.empty():
                     msg = alert_queue.get_nowait()
                     if alert_char.send_notification(msg):
                         print(f'[BLE] Sent: {msg}')
@@ -370,7 +369,7 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
     cv2.resizeWindow(WINDOW_TITLE, 960, 540)
     
     annotator = FrameAnnotator()
-    last_alert_time = 0
+    last_alert_times = {}  # class_id -> last sent timestamp
     frame_delay = max(1, int(1000 / fps))
     
     print('\n' + '=' * 65)
@@ -407,13 +406,12 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
         current_fps = frame_count / elapsed if elapsed > 0 else 0
         
         # Draw status bar
-        cooldown_remaining = max(0, ALERT_COOLDOWN - (current_time - last_alert_time))
         annotator.draw_status_bar(
-            annotated, 
-            current_fps, 
-            frame_count, 
+            annotated,
+            current_fps,
+            frame_count,
             len(obstacles),
-            cooldown_remaining,
+            0,
             critical['name'] if critical else None
         )
         
@@ -422,32 +420,36 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
         status_color = (0, 255, 0) if is_connected else (0, 165, 255)
         status_text = "BLE: Connected" if is_connected else "BLE: Waiting..."
         cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-        
-        # Send alert if needed
-        if critical and (current_time - last_alert_time) >= ALERT_COOLDOWN:
-            # Calculate position (left/center/right)
-            x1, y1, x2, y2 = critical['bbox']
+
+        # Send alert for every detected obstacle (per-object cooldown)
+        frame_width = annotated.shape[1]
+        banner_drawn = False
+        for obstacle in obstacles:
+            class_id = obstacle['class_id']
+            if (current_time - last_alert_times.get(class_id, 0)) < ALERT_COOLDOWN:
+                continue
+
+            x1, y1, x2, y2 = obstacle['bbox']
             cx = (x1 + x2) // 2
-            frame_width = annotated.shape[1]
             if cx < frame_width // 3:
                 position = "left"
             elif cx > 2 * frame_width // 3:
                 position = "right"
             else:
                 position = "center"
-            
-            msg = f"{critical['level']}:{critical['name']}:{critical['confidence']:.0%}:{position}"
+
+            msg = f"{obstacle['level']}:{obstacle['name']}:{obstacle['confidence']:.0%}:{position}"
             alert_queue.put(msg)
-            
-            # Draw alert banner
-            annotator.draw_alert_banner(annotated, f"ALERT: {critical['name']} detected!", critical['level'])
-            
+            last_alert_times[class_id] = current_time
+
+            if not banner_drawn:
+                annotator.draw_alert_banner(annotated, f"ALERT: {obstacle['name']} detected!", obstacle['level'])
+                banner_drawn = True
+
             if is_connected:
                 print(f'[ALERT] {msg}')
             else:
                 print(f'[ALERT] (queued) {msg}')
-            
-            last_alert_time = current_time
         
         # Show frame
         cv2.imshow(WINDOW_TITLE, annotated)
