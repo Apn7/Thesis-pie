@@ -392,40 +392,49 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
         
         frame_count += 1
         current_time = time.time()
-        
+
+        # In headless mode skip every other frame — halves inference load and heat.
+        if HEADLESS and frame_count % 2 == 0:
+            time.sleep(0.03)
+            continue
+
         # Detect obstacles - first detect, then check
         results = detector.detect(frame)
         obstacles = detector.check_for_obstacles(results)
         critical = obstacles[0] if obstacles else None
-        
-        # Get annotated frame from YOLO
-        annotated = detector.get_annotated_frame(results)
-        
-        # Draw all obstacles with custom overlays
-        annotator.draw_all_obstacles(annotated, obstacles)
-        
-        # Calculate FPS
-        elapsed = current_time - start_time
-        current_fps = frame_count / elapsed if elapsed > 0 else 0
-        
-        # Draw status bar
-        annotator.draw_status_bar(
-            annotated,
-            current_fps,
-            frame_count,
-            len(obstacles),
-            0,
-            critical['name'] if critical else None
-        )
-        
-        # BLE status overlay
-        is_connected = connected_event.is_set()
-        status_color = (0, 255, 0) if is_connected else (0, 165, 255)
-        status_text = "BLE: Connected" if is_connected else "BLE: Waiting..."
-        cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+        if not HEADLESS:
+            # Get annotated frame from YOLO
+            annotated = detector.get_annotated_frame(results)
+
+            # Draw all obstacles with custom overlays
+            annotator.draw_all_obstacles(annotated, obstacles)
+
+            # Calculate FPS
+            elapsed = current_time - start_time
+            current_fps = frame_count / elapsed if elapsed > 0 else 0
+
+            # Draw status bar
+            annotator.draw_status_bar(
+                annotated,
+                current_fps,
+                frame_count,
+                len(obstacles),
+                0,
+                critical['name'] if critical else None
+            )
+
+            # BLE status overlay
+            is_connected = connected_event.is_set()
+            status_color = (0, 255, 0) if is_connected else (0, 165, 255)
+            status_text = "BLE: Connected" if is_connected else "BLE: Waiting..."
+            cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        else:
+            is_connected = connected_event.is_set()
+            annotated = None
 
         # Send alert for every detected obstacle (per-object cooldown)
-        frame_width = annotated.shape[1]
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         banner_drawn = False
         for obstacle in obstacles:
             class_id = obstacle['class_id']
@@ -445,7 +454,7 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
             alert_queue.put(msg)
             last_alert_times[class_id] = current_time
 
-            if not banner_drawn:
+            if not banner_drawn and annotated is not None:
                 annotator.draw_alert_banner(annotated, f"ALERT: {obstacle['name']} detected!", obstacle['level'])
                 banner_drawn = True
 
@@ -453,10 +462,9 @@ def run_vision(alert_queue: Queue, connected_event: Event, shutdown_event: Event
                 print(f'[ALERT] {msg}')
             else:
                 print(f'[ALERT] (queued) {msg}')
-        
+
         if HEADLESS:
-            # No display — yield CPU briefly so the process doesn't spin at 100%.
-            time.sleep(0.01)
+            time.sleep(0.03)
         else:
             cv2.imshow(WINDOW_TITLE, annotated)
             key = cv2.waitKey(frame_delay) & 0xFF

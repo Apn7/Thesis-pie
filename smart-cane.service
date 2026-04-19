@@ -13,7 +13,7 @@ Restart=on-failure
 RestartSec=5s
 
 # No display — headless mode is auto-detected by the absence of DISPLAY.
-Environment=DISPLAY=
+Environment=DISPLAY= HOME=/home/pi OMP_NUM_THREADS=2
 
 # Give the process time to clean up BLE on shutdown.
 TimeoutStopSec=10s
